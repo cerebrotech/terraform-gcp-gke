@@ -11,6 +11,9 @@ data "http" "myip" {
   url = "http://ipv4.icanhazip.com"
 }
 
+data "google_compute_zones" "available" {
+}
+
 locals {
   cluster                 = var.cluster == null ? terraform.workspace : var.cluster
   enable_private_endpoint = length(var.master_authorized_networks_config) == 0
@@ -18,7 +21,8 @@ locals {
 
   # Converts a cluster's location to a zone/region. A 'location' may be a region or zone: a region becomes the '[region]-a' zone.
   region = length(split("-", var.location)) == 2 ? var.location : substr(var.location, 0, length(var.location) - 2)
-  zone   = length(split("-", var.location)) == 3 ? var.location : format("%s-a", var.location)
+  zones  = length(split("-", var.location)) == 3 ? [var.location] : (length(var.zones) > 0 ? var.zones : data.google_compute_zones.available.names)
+  zone   = local.zones[0]
 
   authorized_networks = var.allow_local_ip_access ? concat(var.master_authorized_networks_config, [{ "display_name" : "myip", "cidr_block" : "${chomp(data.http.myip.body)}/32" }]) : var.master_authorized_networks_config
 }
@@ -125,9 +129,10 @@ resource "google_filestore_instance" "nfs" {
 resource "google_container_cluster" "domino_cluster" {
   provider = google-beta
 
-  name        = local.cluster
-  location    = var.location
-  description = var.description
+  name           = local.cluster
+  location       = var.location
+  node_locations = local.zones
+  description    = var.description
 
   release_channel {
     channel = var.gke_release_channel
@@ -139,7 +144,8 @@ resource "google_container_cluster" "domino_cluster" {
   remove_default_node_pool = true
 
   # Workaround for https://github.com/terraform-providers/terraform-provider-google/issues/3385
-  initial_node_count = max(1, var.compute_nodes_min) + max(0, var.gpu_nodes_min) + var.platform_nodes_max
+  # 0 compute nodes, 0 GPU nodes, 1 platform node per zone
+  initial_node_count = length(local.zones)
 
   network    = google_compute_network.vpc_network.self_link
   subnetwork = google_compute_subnetwork.default.self_link
@@ -255,7 +261,7 @@ resource "google_container_node_pool" "compute" {
   location = google_container_cluster.domino_cluster.location
   cluster  = google_container_cluster.domino_cluster.name
 
-  initial_node_count = max(1, var.compute_nodes_min)
+  initial_node_count = 0
   autoscaling {
     max_node_count = var.compute_nodes_max
     min_node_count = var.compute_nodes_min
@@ -298,7 +304,7 @@ resource "google_kms_key_ring" "key_ring" {
 resource "google_kms_crypto_key" "crypto_key" {
   name            = local.uuid
   key_ring        = google_kms_key_ring.key_ring.self_link
-  rotation_period = "86400s"
+  rotation_period = "2592000s" # 30 days
   purpose         = "ENCRYPT_DECRYPT"
 }
 
@@ -307,8 +313,7 @@ resource "google_container_node_pool" "gpu" {
   location = google_container_cluster.domino_cluster.location
   cluster  = google_container_cluster.domino_cluster.name
 
-  initial_node_count = max(0, var.gpu_nodes_min)
-
+  initial_node_count = 0
   autoscaling {
     max_node_count = var.gpu_nodes_max
     min_node_count = var.gpu_nodes_min
